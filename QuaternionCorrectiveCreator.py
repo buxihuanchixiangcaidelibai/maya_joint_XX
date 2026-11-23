@@ -26,6 +26,7 @@ WINDOW = "QuaternionCorrectiveCreatorWindow"
 DRIVER_DISPLAY_LAYER = "QuaternionCorrectiveDrivers_LYR"
 SKIN_DISPLAY_LAYER = "QuaternionCorrectiveSkin_LYR"
 CORRECTIVE_RADIUS_OFFSET = 0.5
+MANUAL_DRIVE_VERSION = 3
 DRIVER_CHANNEL_GROUPS = (
     ("旋转", ("rotateX", "rotateY", "rotateZ")),
     ("位移", ("translateX", "translateY", "translateZ")),
@@ -94,42 +95,70 @@ def _connected_multiplier_info(node, attribute):
         queue = next_queue
         if not queue:
             break
+    if target and not move_axis:
+        move_axis = (_recorded_primary_move_axis(target) or
+                     ((_recorded_move_axes(target) or (None,))[0]))
     return target, move_axis
 
 
+def _friendly_input_channel(channel):
+    """Returns an artist-facing transform-channel name."""
+    match = re.match(r"^(rotate|translate|scale)([XYZ])$", channel or "")
+    if not match:
+        return channel or "未知输入"
+    kind = {
+        "rotate": "旋转",
+        "translate": "输入位移",
+        "scale": "缩放",
+    }[match.group(1)]
+    return "{} {}".format(kind, match.group(2))
+
+
 def _friendly_driver_attr(attribute, target_driver=None, move_axis=None,
-                          input_plug=None):
-    """Converts a rig attribute name into a compact Chinese UI label."""
+                          input_plug=None, source_node=None):
+    """Converts one numeric branch into a short artist-facing UI label."""
     if attribute == "quatCorrectiveWeight":
-        return "四元数权重"
+        return "父级四元数旋转权重"
     if attribute == "quatCorrectiveRotationMoveMultiplier":
-        return "旋转位移倍率"
+        return "整体旋转位移倍率"
+
+    if target_driver and move_axis:
+        if input_plug and "." in input_plug:
+            input_node, input_channel = input_plug.rsplit(".", 1)
+            prefix = ""
+            if (source_node and
+                    _short(input_node) != _short(source_node)):
+                prefix = "{}：".format(_short(input_node))
+            return "{}{} → 位移 {}".format(
+                prefix, _friendly_input_channel(input_channel), move_axis)
+        return "位移 {}".format(move_axis)
 
     automatic = re.match(
         r"^qc(Pos|Neg)([XYZ])Move(?:([XYZ]))?Multiplier$", attribute)
     if automatic:
         side = "正" if automatic.group(1) == "Pos" else "负"
         surface_axis = automatic.group(2)
-        target_name = (_short(target_driver) if target_driver
-                       else "{}{}侧修型骨骼".format(side, surface_axis))
+        target_name = "{} {} 修型骨骼".format(side, surface_axis)
         axis = move_axis or automatic.group(3) or surface_axis
-        if input_plug:
-            input_name = input_plug.rsplit("|", 1)[-1]
-            return "{}（{} → {}）".format(target_name, input_name, axis)
-        return "{}（{}）".format(target_name, axis)
+        return "{} · 位移 {}".format(target_name, axis)
 
     manual = re.match(r"^qcManual_(.+)Move(?:([XYZ]))?Multiplier$", attribute)
     if manual:
-        target_name = (_short(target_driver) if target_driver
-                       else manual.group(1))
+        target_name = manual.group(1)
         axis = move_axis or manual.group(2)
-        if input_plug and axis:
-            input_name = input_plug.rsplit("|", 1)[-1]
-            return "{}（{} → {}）".format(
-                target_name, input_name, axis)
-        return ("{}（{}）".format(target_name, axis)
+        return ("{} · 位移 {}".format(target_name, axis)
                 if axis else target_name)
     return attribute
+
+
+def _friendly_driver_row(attribute, target_driver=None, move_axis=None,
+                         input_plug=None, source_node=None):
+    """Builds one flat row containing both the bone name and drive branch."""
+    branch = _friendly_driver_attr(
+        attribute, target_driver, move_axis, input_plug, source_node)
+    if target_driver and move_axis:
+        return "{}  |  {}".format(_short(target_driver), branch)
+    return "系统设置  |  {}".format(branch)
 
 
 def _connect(source, destination):
@@ -311,6 +340,184 @@ def _set_locked_string_attr(node, name, value):
     cmds.setAttr(plug, value or "", type="string")
     cmds.setAttr(plug, lock=True)
     return plug
+
+
+def _record_corrective_root_source(root, source):
+    """Stores the source joint on its corrective root with a rename-safe link."""
+    attribute = "qcSourceJoint"
+    plug = "{}.{}".format(root, attribute)
+    if not cmds.attributeQuery(attribute, node=root, exists=True):
+        cmds.addAttr(root, longName=attribute, attributeType="message")
+    current = cmds.listConnections(
+        plug, source=True, destination=False, plugs=True) or []
+    source_long = (cmds.ls(source, long=True) or [source])[0]
+    source_plug = source_long + ".message"
+    for connection in current:
+        if connection != source_plug and cmds.isConnected(connection, plug):
+            cmds.disconnectAttr(connection, plug)
+    _connect(source_plug, plug)
+
+
+def _recorded_corrective_root_source(root):
+    """Returns the source joint explicitly recorded on a corrective root."""
+    if not cmds.attributeQuery("qcSourceJoint", node=root, exists=True):
+        return None
+    sources = cmds.listConnections(
+        root + ".qcSourceJoint", source=True, destination=False,
+        type="joint") or []
+    if not sources:
+        return None
+    return (cmds.ls(sources[0], long=True) or [sources[0]])[0]
+
+
+def _same_node(first, second):
+    """Compares two Maya nodes without depending on short names."""
+    if not first or not second:
+        return False
+    first_long = (cmds.ls(first, long=True) or [first])[0]
+    second_long = (cmds.ls(second, long=True) or [second])[0]
+    return first_long == second_long
+
+
+def _legacy_corrective_root_matches_source(root, source):
+    """Recognizes an older root, then lets the caller migrate its metadata."""
+    if cmds.attributeQuery("qcQuaternionSource", node=root, exists=True):
+        recorded_path = cmds.getAttr(root + ".qcQuaternionSource") or ""
+        if recorded_path and cmds.objExists(recorded_path):
+            if _same_node(recorded_path, source):
+                return True
+
+    constraints = cmds.listConnections(
+        root, source=True, destination=False, type="pointConstraint") or []
+    for constraint in constraints:
+        for target in cmds.pointConstraint(
+                constraint, query=True, targetList=True) or []:
+            if _same_node(target, source):
+                return True
+    return False
+
+
+def _corrective_root_for_source(source):
+    """Finds a source joint's driver root using metadata, with legacy migration."""
+    if not cmds.objExists(source) or cmds.nodeType(source) != "joint":
+        raise RuntimeError("{} 不是有效的源关节。".format(source))
+
+    candidates = []
+    connected = cmds.listConnections(
+        source + ".message", source=False, destination=True,
+        type="joint") or []
+    for node in connected:
+        if (cmds.attributeQuery(
+                "isQuaternionCorrectiveRoot", node=node, exists=True) and
+                _same_node(_recorded_corrective_root_source(node), source)):
+            candidates.append(node)
+
+    if not candidates:
+        roots = cmds.ls(
+            "*.isQuaternionCorrectiveRoot", objectsOnly=True, long=True) or []
+        for root in roots:
+            if _legacy_corrective_root_matches_source(root, source):
+                candidates.append(root)
+
+    unique = []
+    for node in candidates:
+        long_name = (cmds.ls(node, long=True) or [node])[0]
+        if long_name not in unique:
+            unique.append(long_name)
+    if not unique:
+        raise RuntimeError(
+            "找不到 {} 对应的驱动根骨骼。请先在“创建”页为该关节创建修型系统。".format(
+                _short(source)))
+    if len(unique) > 1:
+        raise RuntimeError(
+            "{} 对应到多个驱动根骨骼，请先清理重复的修型系统：{}。".format(
+                _short(source), "、".join(_short(node) for node in unique)))
+    root = unique[0]
+    _record_corrective_root_source(root, source)
+    return root
+
+
+def _manual_driver_parents_for_root(root):
+    """Returns stable manual-driver groups associated with one QC root."""
+    parents = cmds.listRelatives(root, parent=True, fullPath=True) or []
+    if not parents:
+        return []
+    candidates = cmds.listRelatives(
+        parents[0], children=True, type="transform", fullPath=True) or []
+    result = []
+    for candidate in candidates:
+        if not cmds.attributeQuery(
+                "isQuaternionManualDriverRoot",
+                node=candidate, exists=True):
+            continue
+        if not cmds.attributeQuery(
+                "qcCorrectiveRoot", node=candidate, exists=True):
+            continue
+        connected = cmds.listConnections(
+            candidate + ".qcCorrectiveRoot",
+            source=True, destination=False) or []
+        if connected and _same_node(connected[0], root):
+            result.append(candidate)
+    return result
+
+
+def _manual_driver_parent_for_source(source, root):
+    """Gets a full source-follow parent independent of QC weighted rotation."""
+    existing = _manual_driver_parents_for_root(root)
+    if len(existing) > 1:
+        raise RuntimeError(
+            "{} 存在多个新增驱动稳定父级：{}。".format(
+                _short(source),
+                "、".join(_short(node) for node in existing)))
+    if existing:
+        group = existing[0]
+        orient_constraints = cmds.listConnections(
+            group, source=True, destination=False,
+            type="orientConstraint") or []
+        if orient_constraints:
+            valid = any(
+                any(_same_node(target, source) for target in
+                    (cmds.orientConstraint(
+                        constraint, query=True, targetList=True) or []))
+                for constraint in orient_constraints)
+            if not valid:
+                raise RuntimeError(
+                    "{} 已有其他旋转约束，无法安全跟随 {}。".format(
+                        _short(group), _short(source)))
+        else:
+            cmds.orientConstraint(
+                source, group, maintainOffset=False,
+                name=_short(source) + "_QC_ManualRoot_orientConstraint")
+        return group
+
+    root_parents = cmds.listRelatives(
+        root, parent=True, fullPath=True) or []
+    if not root_parents:
+        raise RuntimeError(
+            "{} 没有四元数参考组，无法创建新增驱动稳定父级。".format(
+                _short(root)))
+    buffer = root_parents[0]
+    name = _short(source) + "_QC_MANUAL_DRV_GRP"
+    group = cmds.createNode("transform", name=name, parent=buffer)
+    cmds.setAttr(group + ".rotate", 0.0, 0.0, 0.0, type="double3")
+    cmds.addAttr(
+        group, longName="isQuaternionManualDriverRoot",
+        attributeType="bool", defaultValue=True)
+    cmds.setAttr(group + ".isQuaternionManualDriverRoot", lock=True)
+    cmds.addAttr(group, longName="qcCorrectiveRoot", attributeType="message")
+    _connect(root + ".message", group + ".qcCorrectiveRoot")
+    cmds.addAttr(group, longName="qcSourceJoint", attributeType="message")
+    _connect(source + ".message", group + ".qcSourceJoint")
+    cmds.pointConstraint(
+        source, group, maintainOffset=False,
+        name=_short(source) + "_QC_ManualRoot_pointConstraint")
+    cmds.orientConstraint(
+        source, group, maintainOffset=False,
+        name=_short(source) + "_QC_ManualRoot_orientConstraint")
+    cmds.scaleConstraint(
+        source, group, maintainOffset=False,
+        name=_short(source) + "_QC_ManualRoot_scaleConstraint")
+    return (cmds.ls(group, long=True) or [group])[0]
 
 
 def _record_branch_input(driver, move_axis, source_node, source_channel):
@@ -1134,6 +1341,7 @@ def create_manual_drive_link(driven, driver, settings):
     axis = settings["surface_axis"]
     extra_axes = _additional_move_axes(settings, axis)
     signed_rotation = settings.get("signed_rotation", False)
+    saved_multiplier_plugs = settings.get("manual_multiplier_plugs", {})
     rest = cmds.getAttr(driven + ".translate")[0]
 
     if signed_rotation:
@@ -1148,9 +1356,12 @@ def create_manual_drive_link(driven, driver, settings):
             for extra_axis in extra_axes)
 
         for slot, (move_axis, base_distance) in enumerate(movements, 1):
-            multiplier_attr = _ensure_attr(
-                driver, _manual_multiplier_name(driven, move_axis, axis),
-                1.0, -10.0, 10.0)
+            multiplier_attr = saved_multiplier_plugs.get(move_axis)
+            if not multiplier_attr or not cmds.objExists(multiplier_attr):
+                multiplier_attr = _ensure_attr(
+                    driver, _manual_multiplier_name(
+                        driven, move_axis, axis),
+                    0.0, -10.0, 10.0)
             label = "Manual{}_{}".format(move_axis, _short(driven))
             distance, distance_nodes = _make_rotation_delta_distance(
                 driver, label, settings["rotation_axis"], base_distance,
@@ -1188,8 +1399,12 @@ def create_manual_drive_link(driven, driver, settings):
         driven, query=True, worldSpace=True, translation=True)
 
     def make_axis_drive(move_axis, base_distance):
-        multiplier_attr = _ensure_attr(
-            driver, _manual_multiplier_name(driven, move_axis, axis), 1.0, -10.0, 10.0)
+        multiplier_attr = saved_multiplier_plugs.get(move_axis)
+        if not multiplier_attr or not cmds.objExists(multiplier_attr):
+            multiplier_attr = _ensure_attr(
+                driver, _manual_multiplier_name(
+                    driven, move_axis, axis),
+                0.0, -10.0, 10.0)
         world_axis = _source_axis_world(driver, move_axis)
         side = 1.0 if sum(
             (driven_position[index] - driver_position[index]) * world_axis[index]
@@ -1229,6 +1444,369 @@ def create_manual_drive_link(driven, driver, settings):
     return tuple(nodes)
 
 
+def _manual_drive_version(driver):
+    """Returns 0 for an unversioned legacy manual graph."""
+    attribute = "qcManualDriveVersion"
+    if not cmds.attributeQuery(attribute, node=driver, exists=True):
+        return 0
+    try:
+        return int(cmds.getAttr(driver + "." + attribute))
+    except (TypeError, ValueError, RuntimeError):
+        return 0
+
+
+def _record_manual_drive_version(driver):
+    _set_locked_axis_attr(
+        driver, "qcManualDriveVersion", MANUAL_DRIVE_VERSION, "long")
+
+
+def _normalized_scene_plug(plug):
+    """Normalizes a transform plug so renamed/long DAG paths compare safely."""
+    if not plug or "." not in plug:
+        return plug or ""
+    node, attribute = plug.rsplit(".", 1)
+    long_names = cmds.ls(node, long=True) or [node]
+    return "{}.{}".format(long_names[0], attribute)
+
+
+def _capture_manual_graph_state(driver):
+    """Captures artist values and branch settings before deleting old nodes."""
+    graph_nodes, multiplier_plugs = _surface_driver_move_graph(driver)
+    primary_axis = _recorded_primary_move_axis(driver)
+    move_axes = list(_recorded_move_axes(driver))
+    rotation_axis = _recorded_rotation_axis(driver)
+    records = {}
+
+    for plug in multiplier_plugs:
+        multiplier_node, attribute = plug.rsplit(".", 1)
+        target, move_axis = _connected_multiplier_info(
+            multiplier_node, attribute)
+        if target and not _same_node(target, driver):
+            continue
+        if not move_axis:
+            move_axis = primary_axis
+        if move_axis not in ("X", "Y", "Z"):
+            continue
+        _distance_node, angle_node = _movement_branch_nodes(
+            multiplier_node, attribute, driver, move_axis)
+        base_distance = None
+        if angle_node and cmds.objExists(angle_node + ".input2"):
+            base_distance = float(cmds.getAttr(angle_node + ".input2"))
+        records[move_axis] = {
+            "plug": _normalized_scene_plug(plug),
+            "value": float(cmds.getAttr(plug)),
+            "base_distance": base_distance,
+            "input_plug": _movement_branch_input(
+                multiplier_node, attribute, driver, move_axis),
+        }
+
+    if not primary_axis and records:
+        primary_axis = next(
+            (axis for axis in "XYZ" if axis in records), None)
+    if not move_axes:
+        move_axes = [axis for axis in "XYZ" if axis in records]
+    if primary_axis and primary_axis not in move_axes:
+        move_axes.insert(0, primary_axis)
+    return {
+        "graph_nodes": graph_nodes,
+        "multiplier_plugs": multiplier_plugs,
+        "records": records,
+        "primary_axis": primary_axis,
+        "move_axes": move_axes,
+        "rotation_axis": rotation_axis,
+        "local_translate": tuple(cmds.getAttr(driver + ".translate")[0]),
+    }
+
+
+def _manual_migration_settings(settings, state):
+    """Keeps recorded axes, base distances and multiplier plugs during upgrade."""
+    migrated = dict(settings)
+    primary_axis = state.get("primary_axis") or settings["surface_axis"]
+    move_axes = list(state.get("move_axes") or [primary_axis])
+    if primary_axis not in move_axes:
+        move_axes.insert(0, primary_axis)
+    migrated["surface_axis"] = primary_axis
+    migrated["extra_axes"] = [
+        axis for axis in "XYZ"
+        if axis in move_axes and axis != primary_axis]
+    migrated["rotation_axis"] = (
+        state.get("rotation_axis") or settings["rotation_axis"])
+    migrated["signed_rotation"] = True
+    migrated["manual_multiplier_plugs"] = {
+        axis: record["plug"]
+        for axis, record in state.get("records", {}).items()
+        if record.get("plug") and cmds.objExists(record["plug"])
+    }
+
+    primary_record = state.get("records", {}).get(primary_axis, {})
+    primary_distance = primary_record.get("base_distance")
+    if primary_distance is not None and abs(primary_distance) > 1e-8:
+        migrated["base_distance"] = primary_distance
+    extra_distances = [
+        state["records"][axis].get("base_distance")
+        for axis in migrated["extra_axes"]
+        if axis in state.get("records", {})]
+    extra_distance = next(
+        (value for value in extra_distances
+         if value is not None and abs(value) > 1e-8), None)
+    if extra_distance is not None:
+        migrated["second_base_distance"] = extra_distance
+        migrated["manual_second_distance"] = extra_distance
+    return migrated
+
+
+def _restore_migrated_manual_branches(driver, source, settings, state):
+    """Restores exact values/base distances/custom inputs after graph rebuild."""
+    primary_axis = settings["surface_axis"]
+    default_input = _normalized_scene_plug(
+        source + ".rotate" + settings["rotation_axis"])
+    multiplier_overrides = settings.get("manual_multiplier_plugs", {})
+
+    for move_axis in [primary_axis] + _additional_move_axes(
+            settings, primary_axis):
+        multiplier_plug = multiplier_overrides.get(move_axis)
+        if not multiplier_plug or not cmds.objExists(multiplier_plug):
+            multiplier_plug = "{}.{}".format(
+                source,
+                _manual_multiplier_name(
+                    driver, move_axis, primary_axis))
+        if not cmds.objExists(multiplier_plug):
+            continue
+        multiplier_plug = _normalized_scene_plug(multiplier_plug)
+        record = state.get("records", {}).get(move_axis)
+        if not record:
+            continue
+        if cmds.getAttr(multiplier_plug, settable=True):
+            cmds.setAttr(multiplier_plug, record["value"])
+        multiplier_node, attribute = multiplier_plug.rsplit(".", 1)
+        _distance_node, angle_node = _movement_branch_nodes(
+            multiplier_node, attribute, driver, move_axis)
+        base_distance = record.get("base_distance")
+        if (angle_node and base_distance is not None and
+                cmds.objExists(angle_node + ".input2")):
+            cmds.setAttr(angle_node + ".input2", base_distance)
+
+        old_input = _normalized_scene_plug(record.get("input_plug"))
+        if (old_input and old_input != default_input and
+                cmds.objExists(old_input)):
+            input_node, input_channel = old_input.rsplit(".", 1)
+            rewire_movement_branch(
+                multiplier_node, attribute, driver, move_axis,
+                input_node, input_channel)
+
+    # Custom inputs may currently be away from their neutral value.  Rebase the
+    # rest translation so upgrading never moves the visible corrective joint.
+    sum_sources = cmds.listConnections(
+        driver + ".translate", source=True,
+        destination=False, plugs=True) or []
+    if sum_sources:
+        sum_node = sum_sources[0].rsplit(".", 1)[0]
+        if cmds.nodeType(sum_node) == "plusMinusAverage":
+            movement = _translate_sum_movement(sum_node)
+            desired = state["local_translate"]
+            base = tuple(
+                desired[index] - movement[index] for index in range(3))
+            cmds.setAttr(
+                sum_node + ".input3D[0]", *base, type="double3")
+
+
+def _rebuild_legacy_manual_graph(driver, source, settings, state,
+                                 target_parent):
+    """Replaces only private manual calculation nodes with the current graph."""
+    old_nodes = [
+        node for node in state.get("graph_nodes", [])
+        if cmds.objExists(node)]
+    if old_nodes:
+        cmds.delete(old_nodes)
+    parents = cmds.listRelatives(driver, parent=True, fullPath=True) or []
+    if not parents or not _same_node(parents[0], target_parent):
+        driver = cmds.parent(driver, target_parent, relative=True)[0]
+        driver = (cmds.ls(driver, long=True) or [driver])[0]
+    cmds.setAttr(
+        driver + ".translate", *state["local_translate"], type="double3")
+    migrated_settings = _manual_migration_settings(settings, state)
+    nodes = create_manual_drive_link(driver, source, migrated_settings)
+    _restore_migrated_manual_branches(
+        driver, source, migrated_settings, state)
+    _record_manual_drive_version(driver)
+    return driver, tuple(nodes)
+
+
+def _set_boolean_marker(node, attribute):
+    """Adds one locked boolean rig marker, or repairs a copied marker."""
+    plug = "{}.{}".format(node, attribute)
+    if not cmds.attributeQuery(attribute, node=node, exists=True):
+        cmds.addAttr(
+            node, longName=attribute, attributeType="bool",
+            defaultValue=True)
+    else:
+        cmds.setAttr(plug, lock=False)
+        cmds.setAttr(plug, True)
+    cmds.setAttr(plug, lock=True)
+
+
+def _remove_copied_marker(node, attribute):
+    """Removes a marker copied from a template joint before changing its role."""
+    if not cmds.attributeQuery(attribute, node=node, exists=True):
+        return
+    plug = "{}.{}".format(node, attribute)
+    cmds.setAttr(plug, lock=False)
+    cmds.deleteAttr(plug)
+
+
+def _manual_corrective_names(template):
+    """Builds a matching DRV/SKIN name pair from the artist's template name."""
+    name = _short(template)
+    if "_QC_SKIN_JNT_" in name:
+        driver_name = name.replace("_QC_SKIN_JNT_", "_QC_DRV_JNT_", 1)
+    elif name.endswith("_QC_SKIN_JNT"):
+        driver_name = name[:-len("_QC_SKIN_JNT")] + "_QC_DRV_JNT"
+    elif "_QC_DRV_JNT_" in name or name.endswith("_QC_DRV_JNT"):
+        driver_name = name
+    else:
+        driver_name = name + "_QC_DRV_JNT"
+    skin_name = driver_name.replace("_QC_DRV_JNT", "_QC_SKIN_JNT", 1)
+    return driver_name, skin_name
+
+
+def _inside_corrective_driver_hierarchy(node):
+    """Checks whether a node belongs to a generated driver hierarchy."""
+    current = node
+    while current and cmds.objExists(current):
+        if (cmds.attributeQuery(
+                "isQuaternionCorrectiveRoot", node=current, exists=True) or
+                cmds.attributeQuery(
+                    "isQuaternionManualDriverRoot",
+                    node=current, exists=True) or
+                cmds.attributeQuery(
+                    "isQuaternionSurfaceDriver", node=current, exists=True)):
+            return True
+        parents = cmds.listRelatives(
+            current, parent=True, fullPath=True) or []
+        current = parents[0] if parents else None
+    return False
+
+
+def _record_driver_skin_pair(driver, skin):
+    """Records the generated skin joint without depending on names."""
+    attribute = "qcSkinJoint"
+    if not cmds.attributeQuery(attribute, node=driver, exists=True):
+        cmds.addAttr(driver, longName=attribute, attributeType="message")
+    _connect(skin + ".message", driver + "." + attribute)
+
+
+def create_manual_corrective_pair(template, source, settings):
+    """Converts a positioned template into a driver and creates its skin joint.
+
+    The template's world transform is preserved while it is moved below a
+    source-following stable group.  This group shares the QC system's neutral
+    frame but does not inherit its bend quaternion, so a zero multiplier cannot
+    orbit the manual bone.  Its former skin-hierarchy parent is reused for the
+    constrained skin joint.  Legacy graphs are upgraded in place.
+    """
+    if not cmds.objExists(template) or cmds.nodeType(template) != "joint":
+        raise RuntimeError("第一选择必须是需要转换的关节骨骼。")
+    if not cmds.objExists(source) or cmds.nodeType(source) != "joint":
+        raise RuntimeError("第二选择必须是负责旋转的源关节。")
+    if _same_node(template, source):
+        raise RuntimeError("摆放骨骼与旋转源关节不能是同一个节点。")
+    if cmds.attributeQuery(
+            "isQuaternionCorrectiveRoot", node=template, exists=True):
+        raise RuntimeError("不能把驱动根骨骼作为新增修型骨骼。")
+
+    descendants = cmds.listRelatives(
+        template, allDescendents=True, type="joint", fullPath=True) or []
+    if any(_same_node(node, source) for node in descendants):
+        raise RuntimeError("旋转源关节不能位于摆放骨骼的子层级中。")
+    if descendants:
+        raise RuntimeError(
+            "{} 下仍有子关节（{}）。请先只保留需要转换的这一根骨骼。".format(
+                _short(template), _short(descendants[0])))
+
+    root = _corrective_root_for_source(source)
+    is_manual_target = cmds.attributeQuery(
+        "isQuaternionManualMoveTarget", node=template, exists=True)
+    existing_skins = _skin_joints_for_driver(template)
+    if existing_skins and not is_manual_target:
+        raise RuntimeError(
+            "{} 已经有配套蒙皮骨骼：{}。".format(
+                _short(template), _short(existing_skins[0])))
+    if len(existing_skins) > 1:
+        raise RuntimeError(
+            "{} 连接了多个蒙皮骨骼，无法安全升级：{}。".format(
+                _short(template),
+                "、".join(_short(node) for node in existing_skins)))
+
+    incoming_translate = cmds.listConnections(
+        template + ".translate", source=True,
+        destination=False, plugs=True) or []
+    existing_manual_graph = bool(
+        incoming_translate and is_manual_target)
+    migration_required = bool(
+        existing_manual_graph and
+        _manual_drive_version(template) < MANUAL_DRIVE_VERSION)
+    migration_state = (_capture_manual_graph_state(template)
+                       if migration_required else None)
+    if incoming_translate and not existing_manual_graph:
+        raise RuntimeError(
+            "{} 已有位移输入（{}），不能作为新的摆放骨骼。".format(
+                _short(template), incoming_translate[0]))
+
+    original_parents = cmds.listRelatives(
+        template, parent=True, fullPath=True) or []
+    original_parent = original_parents[0] if original_parents else None
+    skin_parent = original_parent
+    if (not skin_parent or
+            _inside_corrective_driver_hierarchy(skin_parent)):
+        skin_parent = source
+
+    manual_parent = _manual_driver_parent_for_source(source, root)
+    current_parent_is_manual = bool(
+        original_parent and _same_node(original_parent, manual_parent))
+    if (existing_manual_graph and not current_parent_is_manual and
+            not migration_required):
+        raise RuntimeError(
+            "{} 的新增驱动版本已是当前版本，但不在稳定父级下。".format(
+                _short(template)))
+
+    world_matrix = cmds.xform(
+        template, query=True, worldSpace=True, matrix=True)
+    driver_name, requested_skin_name = _manual_corrective_names(template)
+    driver = cmds.rename(template, driver_name)
+    driver = (cmds.ls(driver, long=True) or [driver])[0]
+    if not current_parent_is_manual and not migration_required:
+        driver = cmds.parent(driver, manual_parent, relative=True)[0]
+        driver = (cmds.ls(driver, long=True) or [driver])[0]
+        cmds.xform(driver, worldSpace=True, matrix=world_matrix)
+
+    # A duplicated skin/driver joint may carry disconnected marker attributes.
+    # Reassign them only after all validation has succeeded.
+    _remove_copied_marker(driver, "isQuaternionCorrectiveSkinJoint")
+    if not existing_manual_graph:
+        _remove_copied_marker(driver, "isQuaternionSurfaceDriver")
+        _remove_copied_marker(driver, "isQuaternionManualMoveTarget")
+        graph_nodes = create_manual_drive_link(driver, source, settings)
+        _record_manual_drive_version(driver)
+    elif migration_required:
+        driver, graph_nodes = _rebuild_legacy_manual_graph(
+            driver, source, settings, migration_state, manual_parent)
+    else:
+        graph_nodes = ()
+    _set_boolean_marker(driver, "isQuaternionSurfaceDriver")
+    _set_boolean_marker(driver, "isQuaternionManualMoveTarget")
+
+    actual_driver_name = _short(driver)
+    if "_QC_DRV_JNT" in actual_driver_name:
+        skin_name = actual_driver_name.replace(
+            "_QC_DRV_JNT", "_QC_SKIN_JNT", 1)
+    else:
+        skin_name = requested_skin_name
+    skin = (existing_skins[0] if existing_skins else
+            _make_skin_joint(driver, skin_parent, skin_name))
+    _record_driver_skin_pair(driver, skin)
+    return driver, skin, tuple(graph_nodes)
+
+
 def _surface_driver_from_selection(node):
     """Resolves a selected driver or constrained skin joint to its surface driver."""
     if cmds.objExists(node) and cmds.attributeQuery("isQuaternionSurfaceDriver", node=node, exists=True):
@@ -1242,12 +1820,19 @@ def _surface_driver_from_selection(node):
 
 
 def _surface_drivers_under_root(root):
-    """Returns every automatic Pos/Neg driver below a corrective root."""
-    descendants = cmds.listRelatives(
-        root, allDescendents=True, type="joint", fullPath=True) or []
-    return [node for node in descendants
-            if cmds.attributeQuery(
-                "isQuaternionSurfaceDriver", node=node, exists=True)]
+    """Returns automatic and stable-parent manual drivers in one QC system."""
+    descendants = []
+    for container in [root] + _manual_driver_parents_for_root(root):
+        descendants.extend(cmds.listRelatives(
+            container, allDescendents=True,
+            type="joint", fullPath=True) or [])
+    result = []
+    for node in descendants:
+        if (cmds.attributeQuery(
+                "isQuaternionSurfaceDriver", node=node, exists=True) and
+                node not in result):
+            result.append(node)
+    return result
 
 
 def _corrective_root_from_selection(node):
@@ -1255,6 +1840,15 @@ def _corrective_root_from_selection(node):
     if (cmds.objExists(node) and cmds.attributeQuery(
             "isQuaternionCorrectiveRoot", node=node, exists=True)):
         return node
+    if (cmds.objExists(node) and cmds.attributeQuery(
+            "isQuaternionManualDriverRoot", node=node, exists=True) and
+            cmds.attributeQuery(
+                "qcCorrectiveRoot", node=node, exists=True)):
+        roots = cmds.listConnections(
+            node + ".qcCorrectiveRoot",
+            source=True, destination=False) or []
+        if roots:
+            return roots[0]
     constraints = cmds.listConnections(
         node, source=True, destination=False,
         type="parentConstraint") or []
@@ -1271,6 +1865,14 @@ def _corrective_root_from_selection(node):
 def _skin_joints_for_driver(driver):
     """Returns skin corrective joints constrained by one surface driver."""
     result = []
+    if cmds.attributeQuery("qcSkinJoint", node=driver, exists=True):
+        for joint in cmds.listConnections(
+                driver + ".qcSkinJoint", source=True,
+                destination=False, type="joint") or []:
+            if (cmds.attributeQuery(
+                    "isQuaternionCorrectiveSkinJoint",
+                    node=joint, exists=True) and joint not in result):
+                result.append(joint)
     constraints = cmds.listConnections(
         driver, source=False, destination=True,
         type="parentConstraint") or []
@@ -1386,12 +1988,13 @@ def _corrective_root_graph_nodes(root, buffer):
 
 
 def delete_corrective_root(root):
-    """Deletes a complete corrective root and every Pos/Neg child system."""
+    """Deletes a complete corrective root and every automatic/manual child."""
     if not (cmds.objExists(root) and cmds.attributeQuery(
             "isQuaternionCorrectiveRoot", node=root, exists=True)):
         raise RuntimeError(
             "{} 不是自动修型父级骨骼。".format(_short(root)))
 
+    manual_parents = _manual_driver_parents_for_root(root)
     surface_drivers = _surface_drivers_under_root(root)
     deleted_drivers = []
     skin_nodes = []
@@ -1416,11 +2019,20 @@ def delete_corrective_root(root):
     root_graph, root_skin_nodes = _corrective_root_graph_nodes(root, buffer)
     skin_nodes.extend(root_skin_nodes)
     graph_nodes.extend(root_graph)
-    root_containers = [root]
+    manual_constraints = []
+    for manual_parent in manual_parents:
+        for constraint_type in (
+                "pointConstraint", "orientConstraint", "scaleConstraint"):
+            manual_constraints.extend(cmds.listConnections(
+                manual_parent, source=True, destination=False,
+                type=constraint_type) or [])
+    graph_nodes.extend(manual_constraints)
+    root_containers = [root] + manual_parents
     if buffer:
         root_containers.append(buffer)
     delete_nodes = list(dict.fromkeys(
-        root_graph + root_skin_nodes + root_containers))
+        root_graph + manual_constraints +
+        root_skin_nodes + root_containers))
     existing = [node for node in delete_nodes if cmds.objExists(node)]
     if existing:
         cmds.delete(existing)
@@ -1666,6 +2278,7 @@ def create_for_joint(source, mesh, driver_parent, settings):
     cmds.setAttr(root + ".segmentScaleCompensate", 0)
     cmds.addAttr(root, longName="isQuaternionCorrectiveRoot", attributeType="bool", defaultValue=True)
     cmds.setAttr(root + ".isQuaternionCorrectiveRoot", lock=True)
+    _record_corrective_root_source(root, source)
     cmds.pointConstraint(source, root, maintainOffset=False, name=short + "_QC_Root_pointConstraint")
     cmds.scaleConstraint(source, root, maintainOffset=False, name=short + "_QC_Root_scaleConstraint")
     nodes = [root] + list(_make_root_quaternion_network(
@@ -2033,7 +2646,7 @@ class _UI(QtWidgets.QDialog):
         page, layout = self._page()
         add_group, add_layout = self._group("新增驱动")
         selection_help = QtWidgets.QLabel(
-            "先选新增修型骨骼，再加选驱动父级。")
+            "先选重新摆放的骨骼，再加选负责旋转的源关节。建立后会自动整理驱动层级并创建蒙皮骨骼。")
         selection_help.setObjectName("instructionLabel")
         add_layout.addWidget(selection_help)
 
@@ -2055,7 +2668,8 @@ class _UI(QtWidgets.QDialog):
             "旋转增量为负时自动沿反轴移动。")
         self.manual_base_distance = self._number(0.02, -1000.0, 1000.0, 0.01)
         self.manual_base_distance.setToolTip(
-            "例如填写 0.02，驱动关节弯曲 10° 时，修型骨骼移动约 0.2 个 Maya 单位。")
+            "新增倍率默认是 0，因此建立后不会移动；在驱动管理中把倍率调到 1 时，"
+            "例如每度位移 0.02、旋转 10°，骨骼约移动 0.2 个 Maya 单位。")
         add_form.addRow("父级旋转", self.manual_rotation_axis)
         add_form.addRow("移动方向", self.manual_surface_axis)
         add_form.addRow("每度位移", self.manual_base_distance)
@@ -2083,28 +2697,6 @@ class _UI(QtWidgets.QDialog):
         manual_button.clicked.connect(self.create_manual_link)
         add_layout.addWidget(manual_button)
         layout.addWidget(add_group)
-
-        rebuild_group, rebuild_layout = self._group("调整已有骨骼位置")
-        rebuild_buttons = QtWidgets.QHBoxLayout()
-        rebuild_buttons.setSpacing(8)
-        disconnect_button = QtWidgets.QPushButton("断开位移")
-        disconnect_button.setToolTip("断开所选自动修型骨骼的位移链接，以便在视图中调整位置。")
-        disconnect_button.clicked.connect(self.disconnect_selected)
-        reconnect_button = QtWidgets.QPushButton("保存并重连")
-        reconnect_button.setObjectName("primaryButton")
-        reconnect_button.setToolTip("保存所选骨骼当前位置，并恢复位移驱动。")
-        reconnect_button.clicked.connect(self.reconnect_selected)
-        rebuild_buttons.addWidget(disconnect_button, 1)
-        rebuild_buttons.addWidget(reconnect_button, 1)
-        rebuild_layout.addLayout(rebuild_buttons)
-        self.update_direction = QtWidgets.QCheckBox(
-            "根据当前位置重新计算单轴移动方向（高级）")
-        self.update_direction.setChecked(False)
-        self.update_direction.setToolTip(
-            "默认关闭：保存新位置但保留创建时记录的移动轴。"
-            "多轴骨骼始终保留原有的全部移动轴。")
-        rebuild_layout.addWidget(self.update_direction)
-        layout.addWidget(rebuild_group)
 
         extend_group, extend_layout = self._collapsible(
             "可选工具 · 补加自动修型位移轴", expanded=False)
@@ -2138,15 +2730,36 @@ class _UI(QtWidgets.QDialog):
         layout.setSpacing(10)
 
         source_row = QtWidgets.QHBoxLayout()
+        source_row.setSpacing(8)
         load_selected = QtWidgets.QPushButton("所选关节")
         load_selected.clicked.connect(lambda: self._load_driver_manager(False))
         scan_scene = QtWidgets.QPushButton("扫描场景")
         scan_scene.clicked.connect(lambda: self._load_driver_manager(True))
+        disconnect_button = QtWidgets.QPushButton("断开位移")
+        disconnect_button.setFixedWidth(90)
+        disconnect_button.setToolTip(
+            "断开所选自动修型骨骼的位移链接，以便在视图中调整位置。")
+        disconnect_button.clicked.connect(self.disconnect_selected)
+        self.update_direction = QtWidgets.QCheckBox("重算方向")
+        self.update_direction.setChecked(False)
+        self.update_direction.setFixedWidth(90)
+        self.update_direction.setToolTip(
+            "默认关闭：保存新位置但保留创建时记录的移动轴。"
+            "勾选后，根据当前位置重新计算单轴骨骼的移动方向；"
+            "多轴骨骼始终保留原有的全部移动轴。")
+        reconnect_button = QtWidgets.QPushButton("保存并重连")
+        reconnect_button.setObjectName("primaryButton")
+        reconnect_button.setFixedWidth(140)
+        reconnect_button.setToolTip(
+            "保存所选骨骼当前位置，并恢复位移驱动。")
+        reconnect_button.clicked.connect(self.reconnect_selected)
         refresh_values = QtWidgets.QPushButton("刷新数值")
         refresh_values.clicked.connect(self._refresh_driver_values)
         source_row.addWidget(load_selected)
         source_row.addWidget(scan_scene)
-        source_row.addStretch(1)
+        source_row.addWidget(disconnect_button)
+        source_row.addWidget(reconnect_button)
+        source_row.addWidget(self.update_direction)
         source_row.addWidget(refresh_values)
         layout.addLayout(source_row)
 
@@ -2326,13 +2939,22 @@ class _UI(QtWidgets.QDialog):
                     node, attribute)
                 input_plug = _movement_branch_input(
                     node, attribute, target_driver, move_axis)
-                rows.append((
-                    _friendly_driver_attr(
-                        attribute, target_driver, move_axis, input_plug),
-                    attribute, target_driver, move_axis, input_plug))
-            for (label, attribute, target_driver,
-                 move_axis, input_plug) in sorted(
-                    rows, key=lambda value: value[0].lower()):
+                rows.append((attribute, target_driver, move_axis, input_plug))
+
+            target_rows = {}
+            system_rows = []
+            for row in rows:
+                attribute, target_driver, move_axis, _input_plug = row
+                if target_driver and move_axis:
+                    target_rows.setdefault(target_driver, []).append(row)
+                else:
+                    system_rows.append(row)
+
+            def add_value_item(parent, row):
+                attribute, target_driver, move_axis, input_plug = row
+                label = _friendly_driver_row(
+                    attribute, target_driver, move_axis,
+                    input_plug, node)
                 item = QtWidgets.QTreeWidgetItem([label, ""])
                 item.setData(0, QtCore.Qt.ItemDataRole.UserRole, node)
                 item.setData(0, int(QtCore.Qt.ItemDataRole.UserRole) + 1, attribute)
@@ -2345,20 +2967,40 @@ class _UI(QtWidgets.QDialog):
                 item.setData(
                     0, int(QtCore.Qt.ItemDataRole.UserRole) + 4,
                     input_plug or "")
-                tooltip = "{}.{}".format(node, attribute)
+                tooltip = "属性：{}.{}".format(node, attribute)
                 if target_driver:
-                    tooltip += "\n对应骨骼：{}".format(target_driver)
-                if move_axis:
-                    tooltip += "\n移动轴：{}".format(move_axis)
+                    tooltip += "\n骨骼：{}".format(target_driver)
                 if input_plug:
-                    tooltip += "\n输入通道：{}".format(input_plug)
+                    tooltip += "\n输入：{}".format(input_plug)
+                if target_driver and move_axis:
+                    tooltip += "\n输出：{}.translate{}".format(
+                        target_driver, move_axis)
                 if target_driver and move_axis:
                     tooltip += ("\n右键：选择输入通道；"
                                 "连续按两次右键：更换连接对象。")
                 item.setToolTip(0, tooltip)
-                top.addChild(item)
+                parent.addChild(item)
                 self.driver_tree.setItemWidget(
                     item, 1, self._driver_value_control(node, attribute, item))
+
+            grouped = []
+            for target_driver, group_rows in target_rows.items():
+                grouped.append((
+                    _short(target_driver), target_driver, group_rows))
+            for _bone_name, target_driver, group_rows in sorted(
+                    grouped, key=lambda value: value[0].lower()):
+                for row in sorted(
+                        group_rows,
+                        key=lambda value: (value[2] or "", value[0])):
+                    add_value_item(top, row)
+
+            if system_rows:
+                for row in sorted(
+                        system_rows,
+                        key=lambda value: _friendly_driver_attr(
+                            value[0], value[1], value[2],
+                            value[3], node).lower()):
+                    add_value_item(top, row)
 
         if len(node_attributes) <= 2:
             self.driver_tree.expandAll()
@@ -2373,6 +3015,27 @@ class _UI(QtWidgets.QDialog):
             message = "没有找到修型驱动数值。请选择源关节，或扫描场景。"
             self._show_status(message, "warning")
 
+    def _reveal_driver_manager_target(self, source, driver):
+        """Expands and focuses the freshly created driver after a rescan."""
+        role = int(QtCore.Qt.ItemDataRole.UserRole)
+        for top_index in range(self.driver_tree.topLevelItemCount()):
+            top = self.driver_tree.topLevelItem(top_index)
+            top_source = top.data(0, role)
+            if not (top_source and _same_node(top_source, source)):
+                continue
+            top.setExpanded(True)
+            for row_index in range(top.childCount()):
+                row = top.child(row_index)
+                target = row.data(0, role + 2)
+                if target and _same_node(target, driver):
+                    if top.isHidden() or row.isHidden():
+                        return False
+                    self.driver_tree.setCurrentItem(row)
+                    self.driver_tree.scrollToItem(row)
+                    return True
+            return False
+        return False
+
     def _filter_driver_items(self, *_):
         if not hasattr(self, "driver_tree"):
             return
@@ -2385,25 +3048,33 @@ class _UI(QtWidgets.QDialog):
         for top_index in range(self.driver_tree.topLevelItemCount()):
             top = self.driver_tree.topLevelItem(top_index)
             node = top.data(0, QtCore.Qt.ItemDataRole.UserRole) or ""
-            group_match = keyword in (top.text(0) + " " + node).lower()
-            visible_children = 0
-            for child_index in range(top.childCount()):
-                child = top.child(child_index)
-                binding = bindings_by_item.get(child)
-                attribute = binding["attribute"] if binding else ""
-                text_match = group_match or keyword in (
-                    child.text(0) + " " + attribute).lower()
-                adjusted_match = (not adjusted_only or
-                                  (binding and abs(
-                                      binding["spin"].value() - binding["default"]) > 1e-6))
+            top_match = keyword in (top.text(0) + " " + node).lower()
+            visible_in_top = 0
+            for row_index in range(top.childCount()):
+                row = top.child(row_index)
+                binding = bindings_by_item.get(row)
+                if not binding:
+                    row.setHidden(True)
+                    continue
+                role = int(QtCore.Qt.ItemDataRole.UserRole)
+                target = row.data(0, role + 2) or ""
+                input_plug = row.data(0, role + 4) or ""
+                searchable = " ".join((
+                    row.text(0), binding["attribute"],
+                    target, input_plug))
+                text_match = top_match or keyword in searchable.lower()
+                adjusted_match = (
+                    not adjusted_only or
+                    abs(binding["spin"].value() -
+                        binding["default"]) > 1e-6)
                 visible = text_match and adjusted_match
-                child.setHidden(not visible)
+                row.setHidden(not visible)
                 if visible:
-                    visible_children += 1
+                    visible_in_top += 1
                     visible_items += 1
                     visible_nodes.add(node)
-            top.setHidden(visible_children == 0)
-            if keyword and visible_children:
+            top.setHidden(visible_in_top == 0)
+            if keyword and visible_in_top:
                 top.setExpanded(True)
         self.driver_summary.setText(
             "显示 {} 个关节 · {} 个驱动项".format(len(visible_nodes), visible_items))
@@ -2648,35 +3319,34 @@ class _UI(QtWidgets.QDialog):
             self, old_target, new_target, changed_item, changed_input):
         """Updates affected rows in place without rebuilding/collapsing the tree."""
         role = int(QtCore.Qt.ItemDataRole.UserRole)
-        for top_index in range(self.driver_tree.topLevelItemCount()):
-            top = self.driver_tree.topLevelItem(top_index)
-            for child_index in range(top.childCount()):
-                child = top.child(child_index)
-                target = child.data(0, role + 2) or ""
-                same_target = (
-                    target == old_target or
-                    (target and old_target and
-                     _short(target) == _short(old_target)))
-                if not same_target:
-                    continue
-                node = child.data(0, role)
-                attribute = child.data(0, role + 1)
-                move_axis = child.data(0, role + 3) or ""
-                input_plug = (changed_input if child is changed_item else
-                              (child.data(0, role + 4) or ""))
-                child.setData(0, role + 2, new_target)
-                child.setData(0, role + 4, input_plug)
-                child.setText(0, _friendly_driver_attr(
-                    attribute, new_target, move_axis, input_plug))
-                tooltip = "{}.{}".format(node, attribute)
-                tooltip += "\n对应骨骼：{}".format(new_target)
-                if move_axis:
-                    tooltip += "\n移动轴：{}".format(move_axis)
-                if input_plug:
-                    tooltip += "\n输入通道：{}".format(input_plug)
-                tooltip += ("\n右键：选择输入通道；"
-                            "连续按两次右键：更换连接对象。")
-                child.setToolTip(0, tooltip)
+        for binding in self._driver_bindings:
+            child = binding["item"]
+            target = child.data(0, role + 2) or ""
+            same_target = (
+                target == old_target or
+                (target and old_target and
+                 _short(target) == _short(old_target)))
+            if not same_target:
+                continue
+            node = child.data(0, role)
+            attribute = child.data(0, role + 1)
+            move_axis = child.data(0, role + 3) or ""
+            input_plug = (changed_input if child is changed_item else
+                          (child.data(0, role + 4) or ""))
+            child.setData(0, role + 2, new_target)
+            child.setData(0, role + 4, input_plug)
+            child.setText(0, _friendly_driver_row(
+                attribute, new_target, move_axis, input_plug, node))
+            tooltip = "属性：{}.{}".format(node, attribute)
+            tooltip += "\n骨骼：{}".format(new_target)
+            if input_plug:
+                tooltip += "\n输入：{}".format(input_plug)
+            if move_axis:
+                tooltip += "\n输出：{}.translate{}".format(
+                    new_target, move_axis)
+            tooltip += ("\n右键：选择输入通道；"
+                        "连续按两次右键：更换连接对象。")
+            child.setToolTip(0, tooltip)
         self.driver_tree.setCurrentItem(changed_item)
 
     def _change_driver_branch_input(self, item, channel, source_node):
@@ -3443,26 +4113,46 @@ class _UI(QtWidgets.QDialog):
         selected = (cmds.ls(orderedSelection=True, long=True) or
                     cmds.ls(selection=True, long=True) or [])
         if len(selected) != 2:
-            message = "请先选择被驱动修型骨骼，再加选驱动骨骼（共两个节点）。"
+            message = "请先选择重新摆放的骨骼，再加选负责旋转的源关节（共两个关节）。"
             cmds.warning(message)
             self._show_status(message, "warning")
             return
-        driven, driver = selected
+        template, source = selected
+        undo_open = False
         try:
             settings = self._manual_settings()
-            nodes = create_manual_drive_link(driven, driver, settings)
-            cmds.select([driven, driver], replace=True)
+            cmds.undoInfo(openChunk=True, chunkName="建立新增修型驱动")
+            undo_open = True
+            driver, skin, nodes = create_manual_corrective_pair(
+                template, source, settings)
+            cmds.select([driver, source], replace=True)
+            if self._display_mode:
+                driver_layer, skin_layer, _driver_count, _skin_count = (
+                    self._sync_bone_display_layers())
+                if driver_layer and skin_layer:
+                    self._apply_display_layer_visibility(
+                        self._display_mode, driver_layer, skin_layer)
+            self._load_driver_manager(True)
+            found_in_manager = self._reveal_driver_manager_target(
+                source, driver)
             axes = [settings["surface_axis"]]
             axes.extend(_additional_move_axes(
                 settings, settings["surface_axis"]))
-            message = "已建立驱动：{} ← {}；移动轴：{}（{} 个节点）。".format(
-                _short(driven), _short(driver),
-                "、".join("自身 +{}".format(axis) for axis in axes),
-                len(nodes))
+            message = (
+                "已建立或更新驱动骨骼 {}，配套蒙皮骨骼 {}；"
+                "旋转源：{}，移动轴：{}。{}".format(
+                    _short(driver), _short(skin), _short(source),
+                    "、".join("自身 +{}".format(axis) for axis in axes),
+                    ("驱动管理已刷新并定位到新增项目。"
+                     if found_in_manager else
+                     "驱动管理已刷新；当前筛选条件可能隐藏了新增项目。")))
             self._show_status(message, "success")
         except RuntimeError as error:
             cmds.warning(str(error))
             self._show_status(str(error), "error")
+        finally:
+            if undo_open:
+                cmds.undoInfo(closeChunk=True)
 
 
 _INSTANCE = None
