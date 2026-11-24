@@ -461,33 +461,67 @@ def _manual_driver_parents_for_root(root):
     return result
 
 
-def _manual_driver_parent_for_source(source, root):
-    """Gets a full source-follow parent independent of QC weighted rotation."""
-    existing = _manual_driver_parents_for_root(root)
-    if len(existing) > 1:
+def _manual_driver_parent_for_source(source, root, follow_node=None):
+    """Gets a stable manual parent for one rotation-source/follow-space pair."""
+    follow_node = follow_node or source
+    if not cmds.objExists(follow_node):
+        raise RuntimeError("空间跟随对象不存在：{}。".format(follow_node))
+
+    matching = []
+    for group in _manual_driver_parents_for_root(root):
+        recorded_follow = []
+        if cmds.attributeQuery("qcFollowNode", node=group, exists=True):
+            recorded_follow = cmds.listConnections(
+                group + ".qcFollowNode",
+                source=True, destination=False) or []
+        if not recorded_follow:
+            # Compatibility with stable groups created before qcFollowNode:
+            # their orient constraint target is their spatial follow object.
+            for constraint in cmds.listConnections(
+                    group, source=True, destination=False,
+                    type="orientConstraint") or []:
+                recorded_follow.extend(cmds.orientConstraint(
+                    constraint, query=True, targetList=True) or [])
+        if recorded_follow and _same_node(recorded_follow[0], follow_node):
+            if not cmds.attributeQuery("qcFollowNode", node=group, exists=True):
+                cmds.addAttr(
+                    group, longName="qcFollowNode", attributeType="message")
+                _connect(follow_node + ".message", group + ".qcFollowNode")
+            matching.append(group)
+
+    if len(matching) > 1:
         raise RuntimeError(
-            "{} 存在多个新增驱动稳定父级：{}。".format(
-                _short(source),
-                "、".join(_short(node) for node in existing)))
-    if existing:
-        group = existing[0]
-        orient_constraints = cmds.listConnections(
-            group, source=True, destination=False,
-            type="orientConstraint") or []
-        if orient_constraints:
+            "{} 在 {} 空间下存在多个新增驱动稳定父级：{}。".format(
+                _short(source), _short(follow_node),
+                "、".join(_short(node) for node in matching)))
+    if matching:
+        group = matching[0]
+        constraint_commands = (
+            ("pointConstraint", cmds.pointConstraint),
+            ("orientConstraint", cmds.orientConstraint),
+            ("scaleConstraint", cmds.scaleConstraint),
+        )
+        for constraint_type, command in constraint_commands:
+            constraints = cmds.listConnections(
+                group, source=True, destination=False,
+                type=constraint_type) or []
             valid = any(
-                any(_same_node(target, source) for target in
-                    (cmds.orientConstraint(
+                any(_same_node(target, follow_node) for target in
+                    (command(
                         constraint, query=True, targetList=True) or []))
-                for constraint in orient_constraints)
-            if not valid:
+                for constraint in constraints)
+            if constraints and not valid:
                 raise RuntimeError(
-                    "{} 已有其他旋转约束，无法安全跟随 {}。".format(
-                        _short(group), _short(source)))
-        else:
-            cmds.orientConstraint(
-                source, group, maintainOffset=False,
-                name=_short(source) + "_QC_ManualRoot_orientConstraint")
+                    "{} 已有其他{}，无法安全跟随 {}。".format(
+                        _short(group), constraint_type,
+                        _short(follow_node)))
+            if not constraints:
+                command(
+                    follow_node, group,
+                    maintainOffset=not _same_node(follow_node, source),
+                    name="{}_QC_{}_ManualRoot_{}".format(
+                        _short(source), _short(follow_node),
+                        constraint_type))
         return group
 
     root_parents = cmds.listRelatives(
@@ -497,7 +531,11 @@ def _manual_driver_parent_for_source(source, root):
             "{} 没有四元数参考组，无法创建新增驱动稳定父级。".format(
                 _short(root)))
     buffer = root_parents[0]
-    name = _short(source) + "_QC_MANUAL_DRV_GRP"
+    source_space = _same_node(follow_node, source)
+    name = (_short(source) + "_QC_MANUAL_DRV_GRP"
+            if source_space else
+            "{}_QC_{}_SPACE_MANUAL_DRV_GRP".format(
+                _short(source), _short(follow_node)))
     group = cmds.createNode("transform", name=name, parent=buffer)
     cmds.setAttr(group + ".rotate", 0.0, 0.0, 0.0, type="double3")
     cmds.addAttr(
@@ -508,15 +546,20 @@ def _manual_driver_parent_for_source(source, root):
     _connect(root + ".message", group + ".qcCorrectiveRoot")
     cmds.addAttr(group, longName="qcSourceJoint", attributeType="message")
     _connect(source + ".message", group + ".qcSourceJoint")
+    cmds.addAttr(group, longName="qcFollowNode", attributeType="message")
+    _connect(follow_node + ".message", group + ".qcFollowNode")
     cmds.pointConstraint(
-        source, group, maintainOffset=False,
-        name=_short(source) + "_QC_ManualRoot_pointConstraint")
+        follow_node, group, maintainOffset=not source_space,
+        name="{}_QC_{}_ManualRoot_pointConstraint".format(
+            _short(source), _short(follow_node)))
     cmds.orientConstraint(
-        source, group, maintainOffset=False,
-        name=_short(source) + "_QC_ManualRoot_orientConstraint")
+        follow_node, group, maintainOffset=not source_space,
+        name="{}_QC_{}_ManualRoot_orientConstraint".format(
+            _short(source), _short(follow_node)))
     cmds.scaleConstraint(
-        source, group, maintainOffset=False,
-        name=_short(source) + "_QC_ManualRoot_scaleConstraint")
+        follow_node, group, maintainOffset=not source_space,
+        name="{}_QC_{}_ManualRoot_scaleConstraint".format(
+            _short(source), _short(follow_node)))
     return (cmds.ls(group, long=True) or [group])[0]
 
 
@@ -839,6 +882,12 @@ def _automatic_corrective_names(source_node, label, move_axes):
             "{}_QC_SKIN_JNT_{}".format(base, suffix))
 
 
+def _matches_numbered_corrective_name(current_name, canonical_name):
+    """Treats Maya's numeric collision suffix as a stable bone identity."""
+    return bool(re.fullmatch(
+        re.escape(canonical_name) + r"(?:\d+)?", current_name))
+
+
 def repair_corrective_bone_names(driver, source_node,
                                  label=None, move_axes=None):
     """Applies the stable DRV/SKIN-before-axis naming convention."""
@@ -852,12 +901,17 @@ def repair_corrective_bone_names(driver, source_node,
     driver_name, skin_name = _automatic_corrective_names(
         source_node, label, axes)
     skin_joints = _skin_joints_for_driver(driver)
-    if _short(driver) != driver_name:
+    # Maya appends 1, 2, ... when another corrective already owns the
+    # canonical name.  That number identifies this particular bone; it is not
+    # an axis error and must not change when only the input channel is rewired.
+    if not _matches_numbered_corrective_name(_short(driver), driver_name):
         driver = cmds.rename(driver, driver_name)
         long_names = cmds.ls(driver, long=True) or [driver]
         driver = long_names[0]
     for skin in skin_joints:
-        if cmds.objExists(skin) and _short(skin) != skin_name:
+        if (cmds.objExists(skin) and
+                not _matches_numbered_corrective_name(
+                    _short(skin), skin_name)):
             cmds.rename(skin, skin_name)
     return driver
 
@@ -1699,10 +1753,11 @@ def create_manual_corrective_pair(template, source, settings):
     """Converts a positioned template into a driver and creates its skin joint.
 
     The template's world transform is preserved while it is moved below a
-    source-following stable group.  This group shares the QC system's neutral
-    frame but does not inherit its bend quaternion, so a zero multiplier cannot
-    orbit the manual bone.  Its former skin-hierarchy parent is reused for the
-    constrained skin joint.  Legacy graphs are upgraded in place.
+    stable group.  By default that group follows the rotation source; when
+    requested it follows the template's original parent instead, while the
+    movement graph still reads the rotation source.  Its former skin-hierarchy
+    parent is reused for the constrained skin joint.  Legacy graphs are
+    upgraded in place.
     """
     if not cmds.objExists(template) or cmds.nodeType(template) != "joint":
         raise RuntimeError("第一选择必须是需要转换的关节骨骼。")
@@ -1760,9 +1815,38 @@ def create_manual_corrective_pair(template, source, settings):
             _inside_corrective_driver_hierarchy(skin_parent)):
         skin_parent = source
 
-    manual_parent = _manual_driver_parent_for_source(source, root)
     current_parent_is_manual = bool(
-        original_parent and _same_node(original_parent, manual_parent))
+        original_parent and cmds.attributeQuery(
+            "isQuaternionManualDriverRoot",
+            node=original_parent, exists=True))
+    if existing_manual_graph and current_parent_is_manual:
+        # Rebuilding an existing driver must preserve its recorded spatial
+        # follow group, regardless of the checkbox's current UI state.
+        manual_parent = original_parent
+    else:
+        # The checkbox chooses the space only for a newly converted joint.
+        # A legacy driver that is being upgraded keeps the historical
+        # source-follow behaviour; changing an existing driver's space here
+        # would cause an unexpected world-space jump during a rebuild.
+        keep_original_space = bool(
+            settings.get("keep_original_parent_space", False) and
+            not existing_manual_graph)
+        if keep_original_space:
+            if not original_parent:
+                raise RuntimeError(
+                    "已勾选“保持原父级空间”，但 {} 没有父级。".format(
+                        _short(template)))
+            if _inside_corrective_driver_hierarchy(original_parent):
+                raise RuntimeError(
+                    "{} 的原父级已位于修型驱动层级中，不能作为独立空间。".format(
+                        _short(template)))
+            follow_node = original_parent
+        else:
+            follow_node = source
+        manual_parent = _manual_driver_parent_for_source(
+            source, root, follow_node)
+        current_parent_is_manual = bool(
+            original_parent and _same_node(original_parent, manual_parent))
     if (existing_manual_graph and not current_parent_is_manual and
             not migration_required):
         raise RuntimeError(
@@ -2126,7 +2210,7 @@ def add_surface_move_axis(driver, axis, base_distance):
         raise RuntimeError("{} 找不到弯曲角度输入。".format(_short(driver)))
 
     multiplier_attr = _ensure_attr(
-        source, extra_attribute, 1.0, -10.0, 10.0)
+        source, extra_attribute, 0.0, -10.0, 10.0)
     prefix = "{}_QC_{}Secondary{}".format(_short(source), label, axis)
     angle_to_distance = cmds.createNode(
         "multDoubleLinear", name=prefix + "_AngleToDistance")
@@ -2158,6 +2242,125 @@ def add_surface_move_axis(driver, axis, base_distance):
         _record_branch_input(
             driver, axis, input_node, input_channel)
     return source, multiplier_attr, (angle_to_distance, distance, vector)
+
+
+def _surface_driver_existing_move_axes(driver):
+    """Returns every movement axis already present on an automatic driver."""
+    axes = list(_recorded_move_axes(driver))
+    _graph_nodes, multiplier_plugs = _surface_driver_move_graph(driver)
+    for plug in multiplier_plugs:
+        attribute = plug.rsplit(".", 1)[-1]
+        match = re.match(
+            r"^qc(?:Pos|Neg)([XYZ])Move(?:([XYZ]))?Multiplier$",
+            attribute)
+        if not match:
+            continue
+        axis = match.group(2) or match.group(1)
+        if axis not in axes:
+            axes.append(axis)
+    if not axes:
+        label = _surface_label_from_driver(driver)
+        if label:
+            axes.append(label[-1])
+    return tuple(axes)
+
+
+def _surface_driver_secondary_move_axes(driver):
+    """Returns removable axes while always protecting the primary axis."""
+    primary_axis = _recorded_primary_move_axis(driver)
+    if not primary_axis:
+        label = _surface_label_from_driver(driver)
+        primary_axis = label[-1] if label else None
+    return tuple(
+        axis for axis in _surface_driver_existing_move_axes(driver)
+        if axis != primary_axis)
+
+
+def remove_surface_move_axis(driver, axis):
+    """Removes one secondary movement branch from an automatic driver."""
+    if axis not in "XYZ":
+        raise RuntimeError("{} 不是有效的位移方向。".format(axis))
+    if not (cmds.objExists(driver) and cmds.attributeQuery(
+            "isQuaternionSurfaceDriver", node=driver, exists=True)):
+        raise RuntimeError("{} 不是自动生成的表面修型骨骼。".format(driver))
+
+    label = _surface_label_from_driver(driver)
+    primary_axis = _recorded_primary_move_axis(driver)
+    if not primary_axis and label:
+        primary_axis = label[-1]
+    if not label or not primary_axis:
+        raise RuntimeError("{} 无法识别主位移方向。".format(_short(driver)))
+    if axis == primary_axis:
+        raise RuntimeError(
+            "{} 是主位移方向；如不再需要它，请删除整根修型骨骼。".format(axis))
+
+    existing_axes = list(_surface_driver_existing_move_axes(driver))
+    if axis not in existing_axes:
+        raise RuntimeError("{} 没有位移 {} 驱动。".format(_short(driver), axis))
+
+    attribute = _secondary_multiplier_name(label, axis)
+    _graph_nodes, multiplier_plugs = _surface_driver_move_graph(driver)
+    matching_plugs = [
+        plug for plug in multiplier_plugs
+        if plug.rsplit(".", 1)[-1] == attribute]
+    if len(matching_plugs) != 1:
+        raise RuntimeError(
+            "{} 找不到唯一的位移 {} 倍率分支。".format(_short(driver), axis))
+    multiplier_plug = matching_plugs[0]
+    source, _attribute = multiplier_plug.rsplit(".", 1)
+    distance_node, angle_node = _movement_branch_nodes(
+        source, attribute, driver, axis)
+    if not distance_node or not angle_node:
+        raise RuntimeError(
+            "{} 的位移 {} 计算分支不完整，未执行删除。".format(
+                _short(driver), axis))
+
+    vector_node = None
+    for candidate in cmds.listConnections(
+            distance_node, source=False, destination=True,
+            type="multiplyDivide") or []:
+        if (_vector_node_axis(candidate) == axis and
+                _branch_reaches_target(candidate, driver)):
+            vector_node = candidate
+            break
+    if not vector_node:
+        raise RuntimeError(
+            "{} 找不到位移 {} 输出向量，未执行删除。".format(
+                _short(driver), axis))
+
+    previous_inputs = [
+        plug.rsplit(".", 1)[0] for plug in cmds.listConnections(
+            angle_node + ".input1", source=True,
+            destination=False, plugs=True) or []]
+    cmds.delete([vector_node, distance_node, angle_node])
+    for input_node in previous_inputs:
+        _delete_orphaned_channel_node(input_node)
+
+    if (cmds.objExists(source) and
+            cmds.attributeQuery(attribute, node=source, exists=True) and
+            not (cmds.listConnections(
+                multiplier_plug, source=True, destination=True) or [])):
+        cmds.deleteAttr(multiplier_plug)
+
+    for metadata_attr in (
+            "qcMove{}Source".format(axis),
+            "qcMove{}SourceChannel".format(axis)):
+        if cmds.attributeQuery(metadata_attr, node=driver, exists=True):
+            metadata_plug = "{}.{}".format(driver, metadata_attr)
+            try:
+                cmds.setAttr(metadata_plug, lock=False)
+            except RuntimeError:
+                pass
+            cmds.deleteAttr(metadata_plug)
+
+    remaining_axes = [
+        move_axis for move_axis in existing_axes if move_axis != axis]
+    _record_axis_metadata(
+        driver, _recorded_rotation_axis(driver), primary_axis,
+        remaining_axes)
+    driver = repair_corrective_bone_names(
+        driver, source, label, move_axes=remaining_axes)
+    return driver, source, attribute
 
 
 def _stored_source_attr(driver):
@@ -2297,10 +2500,10 @@ def create_for_joint(source, mesh, driver_parent, settings):
         extra_axes = _additional_move_axes(settings, surface_axis)
         plus_attr = _ensure_attr(
             source, "qc{}MoveMultiplier".format(plus_label),
-            1.0, -10.0, 10.0)
+            0.0, -10.0, 10.0)
         minus_attr = _ensure_attr(
             source, "qc{}MoveMultiplier".format(minus_label),
-            1.0, -10.0, 10.0)
+            0.0, -10.0, 10.0)
         plus_distance, plus_move_nodes = _make_rotation_distance(
             source, plus_label, settings["rotation_axis"], positive_rotation,
             settings["base_distance"], plus_attr)
@@ -2313,10 +2516,10 @@ def create_for_joint(source, mesh, driver_parent, settings):
         for extra_axis in extra_axes:
             plus_extra_attr = _ensure_attr(
                 source, _secondary_multiplier_name(plus_label, extra_axis),
-                1.0, -10.0, 10.0)
+                0.0, -10.0, 10.0)
             minus_extra_attr = _ensure_attr(
                 source, _secondary_multiplier_name(minus_label, extra_axis),
-                1.0, -10.0, 10.0)
+                0.0, -10.0, 10.0)
             plus_extra_distance, plus_nodes_for_axis = _make_rotation_distance(
                 source, plus_label + "Secondary" + extra_axis,
                 settings["rotation_axis"], positive_rotation,
@@ -2379,6 +2582,9 @@ class _UI(QtWidgets.QDialog):
         self._skin_display_count = 0
         self._active_driver_context_menu = None
         self._active_driver_context_item = None
+        self._maya_callback_ids = []
+        self._manager_history_refresh_pending = False
+        self._last_axis_delete_source = None
         self.setObjectName(WINDOW)
         self.setWindowTitle("骨骼修型")
         self.setWindowFlags(self.windowFlags() | QtCore.Qt.WindowType.Window)
@@ -2389,6 +2595,7 @@ class _UI(QtWidgets.QDialog):
         self._apply_style()
         self.driver_display_button.setChecked(True)
         self._display_mode = "driver"
+        self._install_maya_callbacks()
         QtCore.QTimer.singleShot(0, self._initialize_default_display_mode)
 
     @staticmethod
@@ -2626,7 +2833,7 @@ class _UI(QtWidgets.QDialog):
             "射线从源关节出发的最大搜索距离；没有碰到模型时可增大此值。")
         self.base_distance = self._number(0.02, -1000.0, 1000.0, 0.01)
         self.inverse_quaternion = QtWidgets.QCheckBox("启用")
-        self.inverse_quaternion.setChecked(True)
+        self.inverse_quaternion.setChecked(False)
         advanced_form.addRow("最大表面投射距离", self.probe_distance)
         advanced_form.addRow("主轴每度位移", self.base_distance)
         advanced_form.addRow("反向根骨骼四元数", self.inverse_quaternion)
@@ -2670,9 +2877,16 @@ class _UI(QtWidgets.QDialog):
         self.manual_base_distance.setToolTip(
             "新增倍率默认是 0，因此建立后不会移动；在驱动管理中把倍率调到 1 时，"
             "例如每度位移 0.02、旋转 10°，骨骼约移动 0.2 个 Maya 单位。")
+        self.manual_keep_original_parent = QtWidgets.QCheckBox(
+            "保持原父级空间")
+        self.manual_keep_original_parent.setChecked(False)
+        self.manual_keep_original_parent.setToolTip(
+            "勾选后只读取第二选择骨骼的旋转数值；新增修型骨骼的基础空间继续跟随"
+            "第一选择骨骼创建前的父级，不会被旋转源关节整体带走。")
         add_form.addRow("父级旋转", self.manual_rotation_axis)
         add_form.addRow("移动方向", self.manual_surface_axis)
         add_form.addRow("每度位移", self.manual_base_distance)
+        add_form.addRow("空间跟随", self.manual_keep_original_parent)
         add_layout.addLayout(add_form)
 
         manual_advanced, manual_advanced_layout = self._collapsible(
@@ -2710,7 +2924,7 @@ class _UI(QtWidgets.QDialog):
         self.extend_axis_z.setText("源关节 Z")
         self.extend_distance = self._number(0.02, -1000.0, 1000.0, 0.01)
         self.extend_distance.setToolTip(
-            "新增属性的默认倍率为 1；这里设置旋转每变化 1° 时的基础位移。")
+            "新增属性的默认倍率为 0；这里设置旋转每变化 1° 时的基础位移。")
         extend_form.addRow("补加轴", extend_axis_row)
         extend_form.addRow("每度位移", self.extend_distance)
         extend_layout.addLayout(extend_form)
@@ -2900,8 +3114,96 @@ class _UI(QtWidgets.QDialog):
         self._driver_bindings.append(binding)
         return container
 
-    def _load_driver_manager(self, scan_scene=False):
-        if scan_scene:
+    def _driver_manager_sources(self):
+        role = int(QtCore.Qt.ItemDataRole.UserRole)
+        sources = []
+        for index in range(self.driver_tree.topLevelItemCount()):
+            source = self.driver_tree.topLevelItem(index).data(0, role)
+            if source and cmds.objExists(source) and source not in sources:
+                sources.append(source)
+        return sources
+
+    def _capture_driver_tree_state(self):
+        """Captures expansion, focus and scroll before rebuilding the tree."""
+        role = int(QtCore.Qt.ItemDataRole.UserRole)
+        state = {
+            "had_items": self.driver_tree.topLevelItemCount() > 0,
+            "expanded_sources": [],
+            "current": None,
+            "vertical_scroll": self.driver_tree.verticalScrollBar().value(),
+            "horizontal_scroll": self.driver_tree.horizontalScrollBar().value(),
+        }
+        for index in range(self.driver_tree.topLevelItemCount()):
+            top = self.driver_tree.topLevelItem(index)
+            source = top.data(0, role)
+            if source and top.isExpanded():
+                state["expanded_sources"].append(source)
+        current = self.driver_tree.currentItem()
+        if current is not None:
+            state["current"] = tuple(
+                current.data(0, role + offset) or ""
+                for offset in range(5))
+        return state
+
+    @staticmethod
+    def _driver_state_node_matches(first, second):
+        if not first or not second:
+            return first == second
+        if cmds.objExists(first) and cmds.objExists(second):
+            return _same_node(first, second)
+        return first == second or _short(first) == _short(second)
+
+    def _restore_driver_tree_state(self, state):
+        """Restores the user's exact working area after a manager refresh."""
+        if not state or not state.get("had_items"):
+            return
+        role = int(QtCore.Qt.ItemDataRole.UserRole)
+        expanded_sources = state.get("expanded_sources", [])
+        current_state = state.get("current")
+        restored_current = None
+
+        for top_index in range(self.driver_tree.topLevelItemCount()):
+            top = self.driver_tree.topLevelItem(top_index)
+            source = top.data(0, role) or ""
+            top.setExpanded(any(
+                self._driver_state_node_matches(source, previous)
+                for previous in expanded_sources))
+            if not current_state:
+                continue
+            for row_index in range(top.childCount()):
+                row = top.child(row_index)
+                row_state = tuple(
+                    row.data(0, role + offset) or ""
+                    for offset in range(5))
+                same_source = self._driver_state_node_matches(
+                    row_state[0], current_state[0])
+                same_attribute = row_state[1] == current_state[1]
+                same_axis = row_state[3] == current_state[3]
+                # The target joint can be renamed when an axis is deleted or
+                # restored.  Source + multiplier attribute + output axis is
+                # the stable identity of one manager row.
+                if same_source and same_attribute and same_axis:
+                    restored_current = row
+                    break
+            if restored_current:
+                break
+
+        if restored_current and not restored_current.isHidden():
+            self.driver_tree.setCurrentItem(restored_current)
+        vertical = state.get("vertical_scroll", 0)
+        horizontal = state.get("horizontal_scroll", 0)
+        QtCore.QTimer.singleShot(
+            0, lambda value=vertical:
+            self.driver_tree.verticalScrollBar().setValue(value))
+        QtCore.QTimer.singleShot(
+            0, lambda value=horizontal:
+            self.driver_tree.horizontalScrollBar().setValue(value))
+
+    def _load_driver_manager(self, scan_scene=False, nodes_override=None):
+        tree_state = self._capture_driver_tree_state()
+        if nodes_override is not None:
+            nodes = [node for node in nodes_override if cmds.objExists(node)]
+        elif scan_scene:
             nodes = (cmds.ls(type="joint", long=True) or [])
             nodes += (cmds.ls(type="transform", long=True) or [])
         else:
@@ -2976,7 +3278,7 @@ class _UI(QtWidgets.QDialog):
                     tooltip += "\n输出：{}.translate{}".format(
                         target_driver, move_axis)
                 if target_driver and move_axis:
-                    tooltip += ("\n右键：选择输入通道；"
+                    tooltip += ("\n右键：选择输入通道或补充位移方向；"
                                 "连续按两次右键：更换连接对象。")
                 item.setToolTip(0, tooltip)
                 parent.addChild(item)
@@ -3002,11 +3304,14 @@ class _UI(QtWidgets.QDialog):
                             value[3], node).lower()):
                     add_value_item(top, row)
 
-        if len(node_attributes) <= 2:
+        if tree_state.get("had_items"):
+            self.driver_tree.collapseAll()
+        elif len(node_attributes) <= 2:
             self.driver_tree.expandAll()
         else:
             self.driver_tree.collapseAll()
         self._filter_driver_items()
+        self._restore_driver_tree_state(tree_state)
         if node_attributes:
             message = "已读取 {} 个关节、{} 个驱动数值。".format(
                 len(node_attributes), len(self._driver_bindings))
@@ -3222,6 +3527,44 @@ class _UI(QtWidgets.QDialog):
                     self._change_driver_branch_input(
                         item, selected, source_node))
         menu.addSeparator()
+        surface_driver = (_surface_driver_from_selection(target)
+                          if cmds.objExists(target) else None)
+        add_axes = menu.addAction("补充其他位移方向…")
+        add_axes.setEnabled(bool(surface_driver))
+        if surface_driver:
+            add_axes.setToolTip(
+                "为当前自动修型骨骼补充缺少的 X／Y／Z 位移方向。")
+            add_axes.triggered.connect(
+                lambda checked=False, selected=surface_driver:
+                QtCore.QTimer.singleShot(
+                    0, lambda driver=selected:
+                    self._open_add_surface_axes_dialog(driver)))
+        else:
+            add_axes.setToolTip("该功能仅适用于自动创建的表面修型骨骼。")
+        delete_axes = menu.addAction(
+            "删除当前位移 {} 驱动".format(move_axis))
+        removable_axes = (_surface_driver_secondary_move_axes(surface_driver)
+                          if surface_driver else ())
+        can_delete_current = move_axis in removable_axes
+        delete_axes.setEnabled(can_delete_current)
+        if can_delete_current:
+            delete_axes.setToolTip(
+                "直接删除当前这一行的附加位移驱动；可使用 Maya Undo 撤销。")
+            delete_axes.triggered.connect(
+                lambda checked=False, selected=surface_driver,
+                selected_axis=move_axis:
+                QtCore.QTimer.singleShot(
+                    0, lambda driver=selected, axis=selected_axis:
+                    self._remove_surface_axis_direct(driver, axis)))
+        elif surface_driver and move_axis in _surface_driver_existing_move_axes(
+                surface_driver):
+            delete_axes.setToolTip(
+                "当前行是主位移方向，不能单独删除；请使用顶部按钮删除整根骨骼。")
+        elif surface_driver:
+            delete_axes.setToolTip("当前行没有可删除的附加位移驱动。")
+        else:
+            delete_axes.setToolTip("该功能仅适用于自动创建的表面修型骨骼。")
+        menu.addSeparator()
         change_object = menu.addAction("更换连接对象…")
         change_object.triggered.connect(
             lambda checked=False: self._open_driver_source_dialog(item))
@@ -3315,6 +3658,133 @@ class _UI(QtWidgets.QDialog):
             cmds.warning(str(error))
             self._show_status(str(error), "error")
 
+    def _open_add_surface_axes_dialog(self, driver):
+        """Adds missing output movement axes without leaving driver manager."""
+        if not (driver and cmds.objExists(driver) and cmds.attributeQuery(
+                "isQuaternionSurfaceDriver", node=driver, exists=True)):
+            message = "当前项目不是自动创建的表面修型骨骼。"
+            cmds.warning(message)
+            self._show_status(message, "error")
+            return
+
+        existing_axes = set(_surface_driver_existing_move_axes(driver))
+        missing_axes = [axis for axis in "XYZ" if axis not in existing_axes]
+        if not missing_axes:
+            message = "{} 已包含 X、Y、Z 三个位移方向。".format(
+                _short(driver))
+            self._show_status(message, "success")
+            QtWidgets.QMessageBox.information(
+                self, "补充位移方向", message)
+            return
+
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("补充其他位移方向")
+        dialog.setModal(True)
+        dialog.setMinimumWidth(360)
+        layout = QtWidgets.QVBoxLayout(dialog)
+        layout.addWidget(QtWidgets.QLabel(
+            "当前修型骨骼：{}".format(_short(driver))))
+        rotation_axis = _recorded_rotation_axis(driver)
+        if rotation_axis:
+            layout.addWidget(QtWidgets.QLabel(
+                "继续读取父级旋转 {}，补充以下位移输出：".format(
+                    rotation_axis)))
+        else:
+            layout.addWidget(QtWidgets.QLabel(
+                "补充以下位移输出（沿用当前旋转输入）："))
+
+        axes_layout = QtWidgets.QVBoxLayout()
+        axis_checks = {}
+        for axis in missing_axes:
+            axis_row = QtWidgets.QHBoxLayout()
+            control = QtWidgets.QCheckBox("添加位移 {}".format(axis))
+            axis_checks[axis] = control
+            axis_row.addWidget(control)
+            axis_row.addStretch(1)
+            axes_layout.addLayout(axis_row)
+        layout.addLayout(axes_layout)
+
+        distance_row = QtWidgets.QHBoxLayout()
+        distance_row.addWidget(QtWidgets.QLabel("每旋转 1° 基础位移"))
+        distance = self._number(
+            self.extend_distance.value(), -1000.0, 1000.0, 0.01)
+        distance.setToolTip(
+            "决定旋转角度与位移距离的换算；新轴的倍率仍从 0 开始。")
+        distance_row.addWidget(distance, 1)
+        layout.addLayout(distance_row)
+
+        hint = QtWidgets.QLabel(
+            "新增位移倍率默认为 0，添加后可直接在当前管理页调节。")
+        hint.setObjectName("hintLabel")
+        layout.addWidget(hint)
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok |
+            QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+        add_button = buttons.button(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok)
+        add_button.setText("添加所选方向")
+        add_button.setEnabled(bool(missing_axes))
+        buttons.button(
+            QtWidgets.QDialogButtonBox.StandardButton.Cancel).setText("关闭")
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        def accept_axes():
+            chosen = [axis for axis in missing_axes
+                      if axis_checks[axis].isChecked()]
+            if not chosen:
+                QtWidgets.QMessageBox.warning(
+                    dialog, "补充位移方向", "请至少勾选一个缺少的位移方向。")
+                return
+            if abs(distance.value()) < 1e-8:
+                QtWidgets.QMessageBox.warning(
+                    dialog, "补充位移方向", "每旋转 1° 的基础位移不能为 0。")
+                return
+            dialog.accept()
+
+        buttons.accepted.connect(accept_axes)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        axes = [axis for axis in missing_axes
+                if axis_checks[axis].isChecked()]
+        self.extend_distance.setValue(distance.value())
+        self._add_surface_axes(
+            [driver], axes, distance.value(), focus_driver=driver)
+
+    def _remove_surface_axis_direct(self, driver, axis):
+        """Deletes the exact secondary branch represented by the clicked row."""
+        try:
+            cmds.undoInfo(openChunk=True, chunkName="删除修型骨骼附加位移轴")
+            try:
+                renamed_driver, source, _attribute = remove_surface_move_axis(
+                    driver, axis)
+                if cmds.objExists(renamed_driver):
+                    # Keep the post-delete selection inside the same undo
+                    # chunk, so one Ctrl+Z restores both the branch and the
+                    # artist's previous selection state.
+                    cmds.select(renamed_driver, replace=True)
+            finally:
+                cmds.undoInfo(closeChunk=True)
+        except RuntimeError as error:
+            message = str(error)
+            cmds.warning(message)
+            self._show_status(message, "error")
+            return
+
+        if self.driver_filter.currentIndex() != 0:
+            self.driver_filter.setCurrentIndex(0)
+        self._last_axis_delete_source = source
+        manager_sources = self._driver_manager_sources()
+        if (cmds.objExists(source) and
+                not any(_same_node(source, item) for item in manager_sources)):
+            manager_sources.append(source)
+        self._load_driver_manager(nodes_override=manager_sources)
+        self._reveal_driver_manager_target(source, renamed_driver)
+        self._show_status(
+            "已删除 {} 的位移 {} 驱动；其他链接保持不变。".format(
+                _short(renamed_driver), axis),
+            "success")
+
     def _update_driver_items_after_rewire(
             self, old_target, new_target, changed_item, changed_input):
         """Updates affected rows in place without rebuilding/collapsing the tree."""
@@ -3344,7 +3814,7 @@ class _UI(QtWidgets.QDialog):
             if move_axis:
                 tooltip += "\n输出：{}.translate{}".format(
                     new_target, move_axis)
-            tooltip += ("\n右键：选择输入通道；"
+            tooltip += ("\n右键：选择输入通道或补充位移方向；"
                         "连续按两次右键：更换连接对象。")
             child.setToolTip(0, tooltip)
         self.driver_tree.setCurrentItem(changed_item)
@@ -3408,7 +3878,57 @@ class _UI(QtWidgets.QDialog):
         joints = _skin_joints_for_driver(driver)
         return joints[0] if joints else None
 
+    def _install_maya_callbacks(self):
+        """Listens only for history events; no polling or scene scanning."""
+        for event_name in ("Undo", "Redo"):
+            try:
+                callback_id = om.MEventMessage.addEventCallback(
+                    event_name, self._on_maya_history_event)
+                self._maya_callback_ids.append(callback_id)
+            except RuntimeError:
+                pass
+
+    def _remove_maya_callbacks(self):
+        for callback_id in self._maya_callback_ids:
+            try:
+                om.MMessage.removeCallback(callback_id)
+            except RuntimeError:
+                pass
+        self._maya_callback_ids = []
+
+    def _on_maya_history_event(self, *_):
+        """Schedules a tiny targeted refresh only for this tool's axis delete."""
+        try:
+            history_names = (
+                cmds.undoInfo(query=True, undoName=True) or "",
+                cmds.undoInfo(query=True, redoName=True) or "")
+        except RuntimeError:
+            return
+        chunk_name = "删除修型骨骼附加位移轴"
+        if not any(chunk_name in name for name in history_names):
+            return
+        if (self._manager_history_refresh_pending or
+                self.driver_tree.topLevelItemCount() == 0):
+            return
+        self._manager_history_refresh_pending = True
+        QtCore.QTimer.singleShot(0, self._refresh_manager_after_history)
+
+    def _refresh_manager_after_history(self):
+        self._manager_history_refresh_pending = False
+        if not self.isVisible():
+            return
+        sources = self._driver_manager_sources()
+        source = self._last_axis_delete_source
+        if (source and cmds.objExists(source) and
+                not any(_same_node(source, item) for item in sources)):
+            sources.append(source)
+        if sources:
+            # Re-read only the already displayed sources.  This avoids the
+            # full-scene joint/transform scan used by the manual scan button.
+            self._load_driver_manager(nodes_override=sources)
+
     def closeEvent(self, event):
+        self._remove_maya_callbacks()
         if self._slider_undo_open:
             try:
                 cmds.undoInfo(closeChunk=True)
@@ -3820,6 +4340,8 @@ class _UI(QtWidgets.QDialog):
             "second_base_distance": extra_distance,
             "manual_second_axis": "无",
             "manual_second_distance": extra_distance,
+            "keep_original_parent_space": (
+                self.manual_keep_original_parent.isChecked()),
         }
 
     def create(self, *_):
@@ -3941,6 +4463,60 @@ class _UI(QtWidgets.QDialog):
                 "或对应的蒙皮修型骨骼。")
         return roots, drivers, ignored
 
+    def _add_surface_axes(self, drivers, axes, base_distance,
+                          ignored=(), focus_driver=None):
+        """Shared worker for page-based and context-menu axis additions."""
+        created = []
+        updated_drivers = []
+        errors = []
+        focus_source = None
+        focus_result = None
+        cmds.undoInfo(openChunk=True, chunkName="补加修型骨骼位移轴")
+        try:
+            for driver in drivers:
+                focus_this_driver = bool(
+                    focus_driver and _same_node(driver, focus_driver))
+                naming_source = None
+                naming_label = None
+                for axis in axes:
+                    try:
+                        source, attribute, _nodes = add_surface_move_axis(
+                            driver, axis, base_distance)
+                        created.append("{}.{}".format(_short(source), attribute.rsplit(".", 1)[-1]))
+                        naming_source = source
+                        naming_label = _surface_label_from_driver(
+                            driver, source, attribute.rsplit(".", 1)[-1])
+                    except RuntimeError as error:
+                        errors.append(str(error))
+                if naming_source:
+                    driver = repair_corrective_bone_names(
+                        driver, naming_source, naming_label)
+                    if focus_this_driver:
+                        focus_source = naming_source
+                        focus_result = driver
+                updated_drivers.append(driver)
+        finally:
+            cmds.undoInfo(closeChunk=True)
+
+        if updated_drivers:
+            cmds.select(updated_drivers, replace=True)
+        message = "已补加 {} 个位移轴链接。".format(len(created))
+        if ignored:
+            message += " 已忽略：{}。".format("、".join(ignored))
+        if created:
+            if focus_driver and self.driver_filter.currentIndex() != 0:
+                self.driver_filter.setCurrentIndex(0)
+            self._load_driver_manager(True)
+            if focus_source and focus_result:
+                self._reveal_driver_manager_target(
+                    focus_source, focus_result)
+        if errors:
+            message += " " + " | ".join(errors)
+            cmds.warning(message)
+        elif created:
+            message += " “驱动管理”页已刷新，可直接调节新倍率。"
+        self._show_status(message, "warning" if errors else "success")
+
     def add_axes_to_selected(self, *_):
         axes = [axis for axis, control in (
             ("X", self.extend_axis_x),
@@ -3957,45 +4533,8 @@ class _UI(QtWidgets.QDialog):
             cmds.warning(str(error))
             self._show_status(str(error), "error")
             return
-
-        created = []
-        updated_drivers = []
-        errors = []
-        base_distance = self.extend_distance.value()
-        cmds.undoInfo(openChunk=True, chunkName="补加修型骨骼位移轴")
-        try:
-            for driver in drivers:
-                naming_source = None
-                naming_label = None
-                for axis in axes:
-                    try:
-                        source, attribute, _nodes = add_surface_move_axis(
-                            driver, axis, base_distance)
-                        created.append("{}.{}".format(_short(source), attribute.rsplit(".", 1)[-1]))
-                        naming_source = source
-                        naming_label = _surface_label_from_driver(
-                            driver, source, attribute.rsplit(".", 1)[-1])
-                    except RuntimeError as error:
-                        errors.append(str(error))
-                if naming_source:
-                    driver = repair_corrective_bone_names(
-                        driver, naming_source, naming_label)
-                updated_drivers.append(driver)
-        finally:
-            cmds.undoInfo(closeChunk=True)
-
-        cmds.select(updated_drivers, replace=True)
-        message = "已补加 {} 个位移轴链接。".format(len(created))
-        if ignored:
-            message += " 已忽略：{}。".format("、".join(ignored))
-        if created:
-            self._load_driver_manager(True)
-        if errors:
-            message += " " + " | ".join(errors)
-            cmds.warning(message)
-        elif created:
-            message += " “驱动管理”页已刷新，可直接调节新倍率。"
-        self._show_status(message, "warning" if errors else "success")
+        self._add_surface_axes(
+            drivers, axes, self.extend_distance.value(), ignored=ignored)
 
     def delete_selected_correctives(self, *_):
         try:
@@ -4138,10 +4677,21 @@ class _UI(QtWidgets.QDialog):
             axes = [settings["surface_axis"]]
             axes.extend(_additional_move_axes(
                 settings, settings["surface_axis"]))
+            driver_parents = cmds.listRelatives(
+                driver, parent=True, fullPath=True) or []
+            follow_nodes = []
+            if (driver_parents and cmds.attributeQuery(
+                    "qcFollowNode", node=driver_parents[0], exists=True)):
+                follow_nodes = cmds.listConnections(
+                    driver_parents[0] + ".qcFollowNode",
+                    source=True, destination=False) or []
+            follow_label = (_short(follow_nodes[0])
+                            if follow_nodes else _short(source))
             message = (
                 "已建立或更新驱动骨骼 {}，配套蒙皮骨骼 {}；"
-                "旋转源：{}，移动轴：{}。{}".format(
+                "旋转源：{}，空间跟随：{}，移动轴：{}。{}".format(
                     _short(driver), _short(skin), _short(source),
+                    follow_label,
                     "、".join("自身 +{}".format(axis) for axis in axes),
                     ("驱动管理已刷新并定位到新增项目。"
                      if found_in_manager else
